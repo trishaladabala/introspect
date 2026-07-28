@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="introspect — Real-time ML model consistency monitoring and observability dashboard">
+    <title>introspect — ML Observability Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/dashboard/index.css">
+</head>
+<body>
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <!-- Navigation bar                                                         -->
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <nav id="nav-bar" class="nav-bar">
+        <div class="nav-brand">
+            <span class="nav-logo">◈</span>
+            <span class="nav-title">introspect</span>
+            <span class="nav-badge">v0.1.0</span>
+        </div>
+        <div class="nav-actions">
+            <button id="btn-new-eval" class="btn btn-primary" aria-label="Start new evaluation">
+                <span class="btn-icon">▶</span>
+                New Evaluation
+            </button>
+            <div id="ws-indicator" class="ws-indicator ws-disconnected" title="WebSocket status">
+                <span class="ws-dot"></span>
+                <span class="ws-label">Disconnected</span>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <!-- Main dashboard content                                                 -->
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <main id="dashboard" class="dashboard">
+
+        <!-- ── Summary vitals row ─────────────────────────────────────────── -->
+        <section id="vitals-section" class="vitals-row" aria-label="Key metrics">
+            <div class="vital-card" id="vital-total-runs">
+                <div class="vital-label">Total Runs</div>
+                <div class="vital-value" id="val-total-runs">—</div>
+                <div class="vital-trend" id="trend-total-runs"></div>
+            </div>
+            <div class="vital-card" id="vital-avg-ics">
+                <div class="vital-label">Avg ICS Score</div>
+                <div class="vital-value" id="val-avg-ics">—</div>
+                <div class="vital-trend" id="trend-avg-ics"></div>
+            </div>
+            <div class="vital-card" id="vital-pass-rate">
+                <div class="vital-label">Pass Rate</div>
+                <div class="vital-value" id="val-pass-rate">—</div>
+                <div class="vital-trend" id="trend-pass-rate"></div>
+            </div>
+            <div class="vital-card" id="vital-avg-latency">
+                <div class="vital-label">Avg Latency</div>
+                <div class="vital-value" id="val-avg-latency">—</div>
+                <div class="vital-trend" id="trend-avg-latency"></div>
+            </div>
+        </section>
+
+        <!-- ── Charts row ─────────────────────────────────────────────────── -->
+        <section class="charts-row">
+            <!-- Consistency Timeline -->
+            <div class="card card-lg" id="card-consistency-timeline">
+                <div class="card-header">
+                    <h2 class="card-title">Consistency Timeline</h2>
+                    <span class="card-subtitle">ICS scores across evaluation runs</span>
+                </div>
+                <div class="card-body">
+                    <canvas id="chart-consistency" aria-label="Consistency timeline chart"></canvas>
+                </div>
+            </div>
+
+            <!-- Step Waterfall -->
+            <div class="card card-md" id="card-step-waterfall">
+                <div class="card-header">
+                    <h2 class="card-title">Step Waterfall</h2>
+                    <span class="card-subtitle">Latency per denoising step</span>
+                </div>
+                <div class="card-body">
+                    <canvas id="chart-waterfall" aria-label="Step waterfall chart"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Second row ─────────────────────────────────────────────────── -->
+        <section class="charts-row">
+            <!-- Drift Monitor -->
+            <div class="card card-md" id="card-drift-monitor">
+                <div class="card-header">
+                    <h2 class="card-title">Drift Monitor</h2>
+                    <span class="card-subtitle">Embedding drift over time</span>
+                </div>
+                <div class="card-body">
+                    <canvas id="chart-drift" aria-label="Drift monitor chart"></canvas>
+                </div>
+            </div>
+
+            <!-- Confidence Distribution -->
+            <div class="card card-md" id="card-confidence-dist">
+                <div class="card-header">
+                    <h2 class="card-title">Confidence Distribution</h2>
+                    <span class="card-subtitle">Per-step confidence statistics</span>
+                </div>
+                <div class="card-body">
+                    <canvas id="chart-confidence" aria-label="Confidence distribution chart"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Recent Runs table ──────────────────────────────────────────── -->
+        <section class="card card-full" id="card-recent-runs">
+            <div class="card-header">
+                <h2 class="card-title">Recent Evaluations</h2>
+                <span class="card-subtitle">Click a run for detailed telemetry</span>
+            </div>
+            <div class="card-body">
+                <div class="table-wrapper">
+                    <table id="runs-table" class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Run ID</th>
+                                <th>Status</th>
+                                <th>ICS Score</th>
+                                <th>Drift</th>
+                                <th>Steps</th>
+                                <th>Latency</th>
+                                <th>Result</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="runs-tbody">
+                            <tr class="empty-row">
+                                <td colspan="8">No evaluation runs yet. Click "New Evaluation" to start.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Live evaluation overlay ────────────────────────────────────── -->
+        <div id="live-overlay" class="live-overlay hidden" aria-live="polite">
+            <div class="live-card">
+                <div class="live-header">
+                    <span class="live-pulse"></span>
+                    <h3>Evaluation in Progress</h3>
+                </div>
+                <div class="live-progress">
+                    <div class="live-bar-track">
+                        <div id="live-bar-fill" class="live-bar-fill"></div>
+                    </div>
+                    <span id="live-step-label" class="live-step-label">Step 0/0</span>
+                </div>
+                <div id="live-stats" class="live-stats">
+                    <div class="live-stat">
+                        <span class="live-stat-label">Tokens Unmasked</span>
+                        <span id="live-tokens" class="live-stat-value">0</span>
+                    </div>
+                    <div class="live-stat">
+                        <span class="live-stat-label">Confidence</span>
+                        <span id="live-confidence" class="live-stat-value">—</span>
+                    </div>
+                    <div class="live-stat">
+                        <span class="live-stat-label">Step Latency</span>
+                        <span id="live-latency" class="live-stat-value">—</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <!-- Evaluation config modal                                                -->
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <dialog id="eval-modal" class="modal">
+        <div class="modal-content">
+            <h2 class="modal-title">Configure Evaluation</h2>
+            <form id="eval-form" class="eval-form">
+                <div class="form-group">
+                    <label for="input-seq-len">Sequence Length</label>
+                    <input type="number" id="input-seq-len" value="128" min="8" max="1024" step="8">
+                </div>
+                <div class="form-group">
+                    <label for="input-num-steps">Denoising Steps</label>
+                    <input type="number" id="input-num-steps" value="16" min="2" max="64">
+                </div>
+                <div class="form-group">
+                    <label for="input-inconsistency">Inconsistency Rate</label>
+                    <input type="number" id="input-inconsistency" value="0.1" min="0" max="1" step="0.05">
+                </div>
+                <div class="form-group">
+                    <label for="input-vocab-size">Vocabulary Size</label>
+                    <input type="number" id="input-vocab-size" value="32000" min="100">
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-ghost" id="btn-cancel-eval">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Run Evaluation</button>
+                </div>
+            </form>
+        </div>
+    </dialog>
+
+    <script src="/dashboard/app.js"></script>
+</body>
+</html>
