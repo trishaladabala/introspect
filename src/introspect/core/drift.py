@@ -71,12 +71,7 @@ class DriftReport:
     elapsed_ms: float
 
 
-@dataclass
-class _BaselineRecord:
-    """Internal storage for baseline embedding statistics."""
-    embeddings: NDArray[np.float32]
-    drift_history: list[float] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
+
 
 
 class SemanticDriftDetector:
@@ -95,12 +90,14 @@ class SemanticDriftDetector:
 
     def __init__(
         self,
+        store: Any | None = None,
         threshold_z: float = 2.0,
         min_history: int = 3,
     ) -> None:
         """Initialize the drift detector.
 
         Args:
+            store: MetricsStore instance to fetch historical drift scores.
             threshold_z: Z-score threshold for flagging drift. Values
                 above this are considered anomalous.
             min_history: Minimum number of historical comparisons before
@@ -110,50 +107,29 @@ class SemanticDriftDetector:
         if threshold_z <= 0:
             raise ValueError(f"threshold_z must be positive, got {threshold_z}")
 
+        self._store = store
         self._threshold_z = threshold_z
         self._min_history = min_history
-        self._baselines: dict[str, _BaselineRecord] = {}
 
     @property
     def threshold_z(self) -> float:
         """Current z-score threshold."""
         return self._threshold_z
 
-    @property
-    def baseline_ids(self) -> list[str]:
-        """List of stored baseline identifiers."""
-        return list(self._baselines.keys())
-
-    def set_baseline(
-        self,
-        baseline_id: str,
-        embeddings: NDArray[np.float32],
-    ) -> None:
-        """Store a baseline embedding matrix.
-
-        Args:
-            baseline_id: Unique identifier for this baseline (e.g., "v1.0").
-            embeddings: Embedding matrix (shape: [seq_len, embed_dim]).
-
-        Raises:
-            ValueError: If embeddings is not 2D.
-        """
-        if embeddings.ndim != 2:
-            raise ValueError(f"Embeddings must be 2D, got shape {embeddings.shape}")
-        self._baselines[baseline_id] = _BaselineRecord(embeddings=embeddings.copy())
-
     def compare(
         self,
         baseline_id: str,
         comparison_id: str,
+        baseline_embeddings: NDArray[np.float32],
         comparison_embeddings: NDArray[np.float32],
         layer_segments: dict[str, tuple[int, int]] | None = None,
     ) -> DriftReport:
-        """Compare embeddings against a stored baseline.
+        """Compare embeddings against a baseline in a stateless manner.
 
         Args:
-            baseline_id: Identifier of the baseline to compare against.
+            baseline_id: Identifier of the baseline.
             comparison_id: Identifier for the incoming embeddings.
+            baseline_embeddings: The baseline embedding matrix.
             comparison_embeddings: New embedding matrix (shape: [seq_len, embed_dim]).
             layer_segments: Optional dict mapping layer names to (start, end)
                 index ranges for per-layer analysis. If None, treats the
@@ -163,37 +139,43 @@ class SemanticDriftDetector:
             A DriftReport with aggregate and per-layer metrics.
 
         Raises:
-            KeyError: If baseline_id is not found.
             ValueError: If embedding shapes are incompatible.
         """
         start_time = time.perf_counter()
 
-        if baseline_id not in self._baselines:
-            raise KeyError(f"Baseline '{baseline_id}' not found. Available: {self.baseline_ids}")
-
-        record = self._baselines[baseline_id]
-        baseline_emb = record.embeddings
-
+        if baseline_embeddings.ndim != 2:
+            raise ValueError(
+                f"baseline_embeddings must be 2D, got shape {baseline_embeddings.shape}"
+            )
         if comparison_embeddings.ndim != 2:
             raise ValueError(
                 f"comparison_embeddings must be 2D, got shape {comparison_embeddings.shape}"
             )
-        if comparison_embeddings.shape != baseline_emb.shape:
+        if comparison_embeddings.shape != baseline_embeddings.shape:
             raise ValueError(
-                f"Shape mismatch: baseline={baseline_emb.shape}, "
+                f"Shape mismatch: baseline={baseline_embeddings.shape}, "
                 f"comparison={comparison_embeddings.shape}"
             )
+            
+        drift_history = []
+        if self._store is not None:
+            # Fetch last N aggregate drifts for this baseline specifically to compute z-scores.
+            reports = self._store.get_drift_history(limit=100)
+            drift_history = [
+                r["aggregate_drift"] for r in reversed(reports) 
+                if r["baseline_id"] == baseline_id
+            ]
 
         # Default: treat entire sequence as one segment.
         if layer_segments is None:
-            layer_segments = {"full_sequence": (0, baseline_emb.shape[0])}
+            layer_segments = {"full_sequence": (0, baseline_embeddings.shape[0])}
 
         # Compute per-layer drift.
         layer_drifts: list[LayerDrift] = []
         all_distances: list[float] = []
 
         for layer_name, (start, end) in layer_segments.items():
-            baseline_slice = baseline_emb[start:end]
+            baseline_slice = baseline_embeddings[start:end]
             comparison_slice = comparison_embeddings[start:end]
 
             distances = self._cosine_distances(baseline_slice, comparison_slice)
@@ -203,8 +185,8 @@ class SemanticDriftDetector:
             max_dist = float(distances.max())
             std_dist = float(distances.std())
 
-            z = self._compute_z_score(mean_dist, record.drift_history)
-            flagged = self._is_flagged(mean_dist, z, record.drift_history)
+            z = self._compute_z_score(mean_dist, drift_history)
+            flagged = self._is_flagged(mean_dist, z, drift_history)
 
             layer_drifts.append(LayerDrift(
                 layer_name=layer_name,
@@ -219,11 +201,8 @@ class SemanticDriftDetector:
         # Aggregate metrics.
         all_dist_arr = np.array(all_distances)
         aggregate_drift = float(all_dist_arr.mean())
-        aggregate_z = self._compute_z_score(aggregate_drift, record.drift_history)
-        passed = not self._is_flagged(aggregate_drift, aggregate_z, record.drift_history)
-
-        # Update drift history for future z-score computations.
-        record.drift_history.append(aggregate_drift)
+        aggregate_z = self._compute_z_score(aggregate_drift, drift_history)
+        passed = not self._is_flagged(aggregate_drift, aggregate_z, drift_history)
 
         elapsed = (time.perf_counter() - start_time) * 1000
 

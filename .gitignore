@@ -40,3 +40,5 @@ test-results.xml
 
 # ruff
 .ruff_cache/
+*.db-shm
+*.db-wal

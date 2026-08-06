@@ -33,6 +33,11 @@ from introspect.core.models import (
     ModelConfig,
     GenerationStep,
 )
+from introspect.core.hf_adapter import (
+    BD3Adapter,
+    HuggingFaceAutoregressiveAdapter,
+)
+from starlette.concurrency import run_in_threadpool
 from introspect.storage.timeseries import MetricsStore
 from introspect.tracing.instrumentor import DiffusionInstrumentor
 from introspect.tracing.exporters import SQLiteSpanExporter, PrettyConsoleSpanExporter
@@ -48,7 +53,10 @@ class AppState:
     def __init__(self, db_path: str = "introspect_metrics.db") -> None:
         self.store = MetricsStore(db_path)
         self.scorer = IntrospectiveScorer(threshold=0.85)
-        self.drift_detector = SemanticDriftDetector(threshold_z=2.0)
+        self.drift_detector = SemanticDriftDetector(store=self.store, threshold_z=2.0)
+        
+        self.dlm_adapter: BD3Adapter | None = None
+        self.ar_adapter: HuggingFaceAutoregressiveAdapter | None = None
 
         # Set up tracing with SQLite export.
         sqlite_exporter = SQLiteSpanExporter(db_path)
@@ -82,6 +90,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan — initialize and cleanup resources."""
     global _state
     _state = AppState()
+    
+    # Pre-load real models on startup to avoid latency on evaluation requests
+    _state.dlm_adapter = BD3Adapter(
+        model_name="kuleshov-group/bd3lm-owt-block_size4",
+        max_new_tokens=32,
+        num_steps=16,
+    )
+    _state.ar_adapter = HuggingFaceAutoregressiveAdapter(
+        model_name="distilgpt2",
+        max_new_tokens=32,
+    )
+    
     yield
     _state.close()
     _state = None
@@ -237,9 +257,19 @@ async def trigger_evaluation(
     state.store.update_run_status(run_id, "running")
 
     try:
-        # Generate with DLM (traced).
-        dlm = MockDiffusionModel(config)
-        dlm_result = state.instrumentor.traced_generate(dlm, run_id=run_id)
+        if not state.dlm_adapter or not state.ar_adapter:
+            raise HTTPException(status_code=503, detail="Models are not initialized yet.")
+
+        # Generate with DLM (traced) in a separate thread
+        def run_dlm():
+            return state.instrumentor.traced_generate(
+                model=state.dlm_adapter,
+                run_id=run_id,
+                max_new_tokens=config.seq_len,
+                num_steps=config.num_steps,
+            )
+            
+        dlm_result = await run_in_threadpool(run_dlm)
 
         # Record per-step telemetry.
         for step in dlm_result.steps:
@@ -259,15 +289,23 @@ async def trigger_evaluation(
             # Broadcast step to WebSocket clients.
             await _broadcast_step(run_id, step)
 
-        # Generate with AR model (reference).
-        ar = MockAutoregressiveModel(config)
-        ar_result = ar.generate()
+        # Generate with AR model (reference) in a separate thread.
+        def run_ar():
+            return state.ar_adapter.generate(
+                max_new_tokens=config.seq_len
+            )
+            
+        ar_result = await run_in_threadpool(run_ar)
 
-        # Consistency scoring.
+        # Consistency scoring (align vocabularies for real models)
+        min_vocab = min(dlm_result.logits.shape[-1], ar_result.logits.shape[-1])
+        dlm_logits_aligned = dlm_result.logits[..., :min_vocab]
+        ar_logits_aligned = ar_result.logits[..., :min_vocab]
+        
         with state.instrumentor.trace_operation("consistency.score", {"run_id": run_id}):
             consistency_report = state.scorer.score(
-                dlm_logits=dlm_result.logits,
-                ar_logits=ar_result.logits,
+                dlm_logits=dlm_logits_aligned,
+                ar_logits=ar_logits_aligned,
                 dlm_tokens=dlm_result.token_ids,
                 ar_tokens=ar_result.token_ids,
             )
@@ -286,10 +324,10 @@ async def trigger_evaluation(
 
         # Drift detection.
         with state.instrumentor.trace_operation("drift.detect", {"run_id": run_id}):
-            state.drift_detector.set_baseline("reference", ar_result.embeddings)
             drift_report = state.drift_detector.compare(
                 baseline_id="reference",
                 comparison_id=f"dlm-{run_id}",
+                baseline_embeddings=ar_result.embeddings,
                 comparison_embeddings=dlm_result.embeddings,
             )
 

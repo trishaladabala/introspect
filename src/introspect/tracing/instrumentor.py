@@ -81,11 +81,12 @@ class DiffusionInstrumentor:
 
     def traced_generate(
         self,
-        model: ModelAdapter,
-        prompt_ids: np.ndarray | None = None,
+        model: Any,
+        prompt_ids: NDArray[np.int64] | None = None,
         run_id: str | None = None,
+        **kwargs: Any,
     ) -> GenerationResult:
-        """Execute model generation with full tracing instrumentation.
+        """Wrap a model generation call in an OpenTelemetry trace.
 
         Creates a root span for the entire generation, with child spans
         for each denoising step. All spans include detailed attributes.
@@ -94,6 +95,7 @@ class DiffusionInstrumentor:
             model: The model adapter to generate with.
             prompt_ids: Optional prompt token IDs.
             run_id: Optional run identifier for correlation.
+            **kwargs: Additional generation parameters.
 
         Returns:
             The GenerationResult from the model, unchanged.
@@ -113,7 +115,7 @@ class DiffusionInstrumentor:
             attributes=span_attrs,
         ) as root_span:
             try:
-                result = model.generate(prompt_ids)
+                result = model.generate(prompt_ids, **kwargs)
 
                 # Annotate root span with aggregate metrics.
                 root_span.set_attribute(
