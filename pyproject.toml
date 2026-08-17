@@ -72,5 +72,7 @@ markers = [
     "consistency: marks tests for introspective consistency evaluation",
     "drift: marks tests for semantic drift detection",
     "integration: marks integration tests requiring API server",
+    "slow: marks tests requiring real model downloads (deselect with '-m not slow')",
+    "validation: marks mathematical property validation tests",
 ]
 asyncio_mode = "auto"

@@ -77,14 +77,21 @@ class DriftReport:
 class SemanticDriftDetector:
     """Detects semantic drift in continuous embedding spaces.
 
-    Compares incoming embeddings against stored baselines using cosine
-    distance. Maintains a drift history to compute z-scores, enabling
-    statistically grounded anomaly detection.
+    Compares incoming embeddings against a baseline using cosine distance.
+    Optionally queries a MetricsStore for historical drift scores to compute
+    z-scores, enabling statistically grounded anomaly detection.
+
+    The detector is stateless — both baseline and comparison embeddings are
+    passed directly to ``compare()``, making it safe for concurrent use and
+    simple to test.
 
     Usage:
         detector = SemanticDriftDetector(threshold_z=2.0)
-        detector.set_baseline("v1.0", baseline_embeddings)
-        report = detector.compare("v1.0", "v1.1-quantized", new_embeddings)
+        report = detector.compare(
+            "v1.0", "v1.1-quantized",
+            baseline_embeddings=baseline,
+            comparison_embeddings=new_embeddings,
+        )
         assert report.passed, f"Drift z-score {report.aggregate_z_score:.2f} exceeds threshold"
     """
 

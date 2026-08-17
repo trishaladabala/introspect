@@ -216,10 +216,10 @@ def main() -> None:
 
         detector = SemanticDriftDetector(threshold_z=2.0)
         with instrumentor.trace_operation("drift.detect", {"run_id": run_id}):
-            detector.set_baseline("ar-reference", ar_emb)
             drift = detector.compare(
                 baseline_id="ar-reference",
                 comparison_id=f"dlm-{run_id}",
+                baseline_embeddings=ar_emb,
                 comparison_embeddings=dlm_emb,
             )
 

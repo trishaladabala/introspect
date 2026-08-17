@@ -55,7 +55,7 @@ def main() -> None:
     # ── serve ───────────────────────────────────────────────────────────────
     serve_parser = subparsers.add_parser("serve", help="Start the dashboard server")
     serve_parser.add_argument("--host", type=str, default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=87100)
+    serve_parser.add_argument("--port", type=int, default=8710)
     serve_parser.add_argument("--db", type=str, default="introspect_metrics.db")
 
     # ── stats ───────────────────────────────────────────────────────────────
@@ -185,10 +185,10 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     # ── Drift detection ─────────────────────────────────────────────────────
     print(f"  {_YELLOW}▸ Detecting semantic drift...{_RESET}")
     detector = SemanticDriftDetector(threshold_z=2.0)
-    detector.set_baseline("ar-reference", ar_result.embeddings)
     drift = detector.compare(
         baseline_id="ar-reference",
         comparison_id=f"dlm-{run_id}",
+        baseline_embeddings=ar_result.embeddings,
         comparison_embeddings=dlm_result.embeddings,
     )
 

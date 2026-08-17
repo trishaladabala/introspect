@@ -508,10 +508,25 @@ class BD3Adapter:
         
         # Patch for transformers 4.49.0 issue with custom models missing all_tied_weights_keys
         import transformers
-        patched = False
+        patched_tied = False
         if not hasattr(transformers.PreTrainedModel, "all_tied_weights_keys"):
             transformers.PreTrainedModel.all_tied_weights_keys = property(lambda self: {})
-            patched = True
+            patched_tied = True
+
+        # Patch torch.compile for Python 3.12+ / PyTorch < 2.5 incompatibility.
+        # BD3-LM's modeling code uses @torch.compile decorators which require
+        # Dynamo. On Python 3.12 + PyTorch < 2.5, Dynamo is unsupported.
+        # We replace torch.compile with a no-op identity decorator for loading.
+        # This is safe: we run inference-only on CPU where torch.compile
+        # provides no benefit anyway.
+        original_compile = torch.compile
+        compile_patched = False
+        try:
+            # Test if compile works.
+            torch.compile(lambda x: x)
+        except RuntimeError:
+            torch.compile = lambda fn=None, *args, **kwargs: fn if fn is not None else (lambda f: f)
+            compile_patched = True
 
         # Load BD3 model. The custom code gracefully falls back to SDPA if flash_attn is missing.
         self._model = AutoModelForMaskedLM.from_pretrained(
@@ -523,7 +538,10 @@ class BD3Adapter:
         self._model.config.attn_backend = "sdpa"
         self._model.eval()
         
-        if patched:
+        # Restore patches.
+        if compile_patched:
+            torch.compile = original_compile
+        if patched_tied:
             del transformers.PreTrainedModel.all_tied_weights_keys
 
         

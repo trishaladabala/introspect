@@ -2,7 +2,10 @@
 test_drift.py — Tests for the Semantic Drift Detector.
 
 Validates drift detection with synthetic embedding pairs, threshold
-flagging accuracy, baseline management, and edge cases.
+flagging accuracy, z-score history, and edge cases.
+
+All tests use the stateless ``compare()`` API — both baseline and
+comparison embeddings are passed directly to the detector.
 """
 
 from __future__ import annotations
@@ -21,8 +24,11 @@ class TestSemanticDriftDetector:
         detector = SemanticDriftDetector(threshold_z=2.0)
         embeddings = np.random.randn(32, 64).astype(np.float32)
 
-        detector.set_baseline("v1", embeddings)
-        report = detector.compare("v1", "v1-copy", embeddings)
+        report = detector.compare(
+            "v1", "v1-copy",
+            baseline_embeddings=embeddings,
+            comparison_embeddings=embeddings,
+        )
 
         assert report.aggregate_drift == pytest.approx(0.0, abs=1e-6)
         assert report.passed is True
@@ -35,8 +41,11 @@ class TestSemanticDriftDetector:
         baseline = rng.standard_normal((32, 64)).astype(np.float32)
         comparison = rng.standard_normal((32, 64)).astype(np.float32)
 
-        detector.set_baseline("v1", baseline)
-        report = detector.compare("v1", "v2-random", comparison)
+        report = detector.compare(
+            "v1", "v2-random",
+            baseline_embeddings=baseline,
+            comparison_embeddings=comparison,
+        )
 
         # Cosine distance between random vectors should be ~1.0.
         assert report.aggregate_drift > 0.5
@@ -52,8 +61,11 @@ class TestSemanticDriftDetector:
         noise = rng.standard_normal((32, 64)).astype(np.float32) * 0.01
         comparison = baseline + noise
 
-        detector.set_baseline("v1", baseline)
-        report = detector.compare("v1", "v1.1", comparison)
+        report = detector.compare(
+            "v1", "v1.1",
+            baseline_embeddings=baseline,
+            comparison_embeddings=comparison,
+        )
 
         assert report.aggregate_drift < 0.1
         assert report.passed is True
@@ -69,10 +81,10 @@ class TestSemanticDriftDetector:
         comparison = baseline.copy()
         comparison[32:] += rng.standard_normal((32, 32)).astype(np.float32) * 2.0
 
-        detector.set_baseline("v1", baseline)
         report = detector.compare(
             "v1", "v2",
-            comparison,
+            baseline_embeddings=baseline,
+            comparison_embeddings=comparison,
             layer_segments={
                 "layer_0": (0, 32),
                 "layer_1": (32, 64),
@@ -86,32 +98,55 @@ class TestSemanticDriftDetector:
         assert report.layer_drifts[1].mean_cosine_distance > report.layer_drifts[0].mean_cosine_distance
 
     def test_z_score_detection_with_history(self) -> None:
-        """Z-score detection should activate after sufficient history."""
-        detector = SemanticDriftDetector(threshold_z=2.0, min_history=3)
+        """Z-score detection should activate after sufficient history.
+
+        We wire up a MetricsStore so the detector can fetch historical
+        drift scores and compute z-scores for anomaly flagging.
+        """
+        from introspect.storage.timeseries import MetricsStore
+        import tempfile, os
+
+        db_path = os.path.join(tempfile.mkdtemp(), "test_drift_history.db")
+        store = MetricsStore(db_path)
+
+        detector = SemanticDriftDetector(store=store, threshold_z=2.0, min_history=3)
         rng = np.random.default_rng(42)
 
         baseline = rng.standard_normal((16, 32)).astype(np.float32)
-        detector.set_baseline("v1", baseline)
 
         # Build history with small perturbations.
         for i in range(4):
             noise = rng.standard_normal((16, 32)).astype(np.float32) * 0.01
-            detector.compare("v1", f"v1.{i}", baseline + noise)
+            report = detector.compare(
+                "v1", f"v1.{i}",
+                baseline_embeddings=baseline,
+                comparison_embeddings=baseline + noise,
+            )
+            # Persist the drift report so the store has history.
+            run_id = store.create_run(model_config={"test": True})
+            store.record_drift(
+                run_id=run_id,
+                aggregate_drift=report.aggregate_drift,
+                aggregate_z_score=report.aggregate_z_score,
+                passed=report.passed,
+                threshold_z=report.threshold_z,
+                baseline_id=report.baseline_id,
+                comparison_id=report.comparison_id,
+                elapsed_ms=report.elapsed_ms,
+            )
 
         # Now a large perturbation should be flagged.
         big_noise = rng.standard_normal((16, 32)).astype(np.float32) * 3.0
-        report = detector.compare("v1", "v1-anomaly", baseline + big_noise)
+        report = detector.compare(
+            "v1", "v1-anomaly",
+            baseline_embeddings=baseline,
+            comparison_embeddings=baseline + big_noise,
+        )
 
         assert report.aggregate_z_score > 2.0
         assert report.passed is False
 
-    def test_baseline_not_found_raises(self) -> None:
-        """Comparing against a nonexistent baseline should raise KeyError."""
-        detector = SemanticDriftDetector()
-
-        comparison = np.random.randn(10, 32).astype(np.float32)
-        with pytest.raises(KeyError, match="not found"):
-            detector.compare("nonexistent", "v2", comparison)
+        store.close()
 
     def test_shape_mismatch_raises(self) -> None:
         """Mismatched embedding shapes should raise ValueError."""
@@ -120,34 +155,45 @@ class TestSemanticDriftDetector:
         baseline = np.random.randn(10, 32).astype(np.float32)
         comparison = np.random.randn(10, 64).astype(np.float32)
 
-        detector.set_baseline("v1", baseline)
         with pytest.raises(ValueError, match="Shape mismatch"):
-            detector.compare("v1", "v2", comparison)
+            detector.compare(
+                "v1", "v2",
+                baseline_embeddings=baseline,
+                comparison_embeddings=comparison,
+            )
 
-    def test_non_2d_embeddings_raises(self) -> None:
-        """Non-2D embeddings should raise ValueError."""
+    def test_non_2d_baseline_raises(self) -> None:
+        """Non-2D baseline embeddings should raise ValueError."""
         detector = SemanticDriftDetector()
 
         with pytest.raises(ValueError, match="must be 2D"):
-            detector.set_baseline("v1", np.ones(10, dtype=np.float32))
+            detector.compare(
+                "v1", "v2",
+                baseline_embeddings=np.ones(10, dtype=np.float32),
+                comparison_embeddings=np.ones((10, 8), dtype=np.float32),
+            )
 
-    def test_baseline_ids_property(self) -> None:
-        """baseline_ids should list all stored baselines."""
+    def test_non_2d_comparison_raises(self) -> None:
+        """Non-2D comparison embeddings should raise ValueError."""
         detector = SemanticDriftDetector()
-        assert detector.baseline_ids == []
 
-        detector.set_baseline("v1", np.random.randn(5, 8).astype(np.float32))
-        detector.set_baseline("v2", np.random.randn(5, 8).astype(np.float32))
-
-        assert sorted(detector.baseline_ids) == ["v1", "v2"]
+        with pytest.raises(ValueError, match="must be 2D"):
+            detector.compare(
+                "v1", "v2",
+                baseline_embeddings=np.ones((10, 8), dtype=np.float32),
+                comparison_embeddings=np.ones(10, dtype=np.float32),
+            )
 
     def test_report_timestamps_and_ids(self) -> None:
         """DriftReport should have correct baseline and comparison IDs."""
         detector = SemanticDriftDetector()
         emb = np.random.randn(8, 16).astype(np.float32)
 
-        detector.set_baseline("baseline-A", emb)
-        report = detector.compare("baseline-A", "comparison-B", emb)
+        report = detector.compare(
+            "baseline-A", "comparison-B",
+            baseline_embeddings=emb,
+            comparison_embeddings=emb,
+        )
 
         assert report.baseline_id == "baseline-A"
         assert report.comparison_id == "comparison-B"
@@ -158,3 +204,26 @@ class TestSemanticDriftDetector:
         """threshold_z must be positive."""
         with pytest.raises(ValueError, match="must be positive"):
             SemanticDriftDetector(threshold_z=-1.0)
+
+    def test_drift_monotonically_increases_with_noise(self) -> None:
+        """Increasing perturbation magnitude should increase drift score."""
+        detector = SemanticDriftDetector(threshold_z=2.0)
+        rng = np.random.default_rng(99)
+
+        baseline = rng.standard_normal((32, 64)).astype(np.float32)
+        drift_scores = []
+
+        for scale in [0.01, 0.1, 0.5, 1.0, 2.0]:
+            noise = rng.standard_normal((32, 64)).astype(np.float32) * scale
+            report = detector.compare(
+                "base", f"perturbed-{scale}",
+                baseline_embeddings=baseline,
+                comparison_embeddings=baseline + noise,
+            )
+            drift_scores.append(report.aggregate_drift)
+
+        # Drift should generally increase (allow minor non-monotonicity
+        # due to random direction alignment).
+        assert drift_scores[-1] > drift_scores[0], (
+            f"Expected drift to increase with noise, got {drift_scores}"
+        )

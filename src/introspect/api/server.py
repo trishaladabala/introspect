@@ -31,6 +31,7 @@ from introspect.core.models import (
     MockDiffusionModel,
     MockAutoregressiveModel,
     ModelConfig,
+    GenerationResult,
     GenerationStep,
 )
 from introspect.core.hf_adapter import (
@@ -89,18 +90,21 @@ def get_state() -> AppState:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan — initialize and cleanup resources."""
     global _state
+    import os
     _state = AppState()
     
-    # Pre-load real models on startup to avoid latency on evaluation requests
-    _state.dlm_adapter = BD3Adapter(
-        model_name="kuleshov-group/bd3lm-owt-block_size4",
-        max_new_tokens=32,
-        num_steps=16,
-    )
-    _state.ar_adapter = HuggingFaceAutoregressiveAdapter(
-        model_name="distilgpt2",
-        max_new_tokens=32,
-    )
+    # Only pre-load real models when explicitly requested (e.g. production).
+    # Tests and lightweight starts skip this to avoid blocking on model downloads.
+    if os.environ.get("INTROSPECT_LOAD_MODELS", "").strip() == "1":
+        _state.dlm_adapter = BD3Adapter(
+            model_name="kuleshov-group/bd3lm-owt-block_size4",
+            max_new_tokens=32,
+            num_steps=16,
+        )
+        _state.ar_adapter = HuggingFaceAutoregressiveAdapter(
+            model_name="distilgpt2",
+            max_new_tokens=32,
+        )
     
     yield
     _state.close()
@@ -257,19 +261,31 @@ async def trigger_evaluation(
     state.store.update_run_status(run_id, "running")
 
     try:
-        if not state.dlm_adapter or not state.ar_adapter:
-            raise HTTPException(status_code=503, detail="Models are not initialized yet.")
+        use_real_models = state.dlm_adapter is not None and state.ar_adapter is not None
 
-        # Generate with DLM (traced) in a separate thread
-        def run_dlm():
-            return state.instrumentor.traced_generate(
-                model=state.dlm_adapter,
-                run_id=run_id,
-                max_new_tokens=config.seq_len,
-                num_steps=config.num_steps,
-            )
-            
-        dlm_result = await run_in_threadpool(run_dlm)
+        if use_real_models:
+            # Generate with real DLM (traced) in a separate thread.
+            def run_dlm() -> GenerationResult:
+                return state.instrumentor.traced_generate(
+                    model=state.dlm_adapter,
+                    run_id=run_id,
+                    max_new_tokens=config.seq_len,
+                    num_steps=config.num_steps,
+                )
+
+            dlm_result = await run_in_threadpool(run_dlm)
+
+            # Generate with real AR model (reference) in a separate thread.
+            def run_ar() -> GenerationResult:
+                return state.ar_adapter.generate(max_new_tokens=config.seq_len)
+
+            ar_result = await run_in_threadpool(run_ar)
+        else:
+            # Fall back to mock models (tests, lightweight starts).
+            dlm = MockDiffusionModel(config)
+            ar = MockAutoregressiveModel(config)
+            dlm_result = state.instrumentor.traced_generate(dlm, run_id=run_id)
+            ar_result = ar.generate()
 
         # Record per-step telemetry.
         for step in dlm_result.steps:
@@ -289,25 +305,24 @@ async def trigger_evaluation(
             # Broadcast step to WebSocket clients.
             await _broadcast_step(run_id, step)
 
-        # Generate with AR model (reference) in a separate thread.
-        def run_ar():
-            return state.ar_adapter.generate(
-                max_new_tokens=config.seq_len
-            )
-            
-        ar_result = await run_in_threadpool(run_ar)
+        # Align sequences for scoring (models may produce different lengths).
+        min_len = min(len(dlm_result.token_ids), len(ar_result.token_ids))
+        dlm_tokens = dlm_result.token_ids[:min_len]
+        ar_tokens = ar_result.token_ids[:min_len]
+        dlm_logits_for_score = dlm_result.logits[:min_len]
+        ar_logits_for_score = ar_result.logits[:min_len]
 
         # Consistency scoring (align vocabularies for real models)
-        min_vocab = min(dlm_result.logits.shape[-1], ar_result.logits.shape[-1])
-        dlm_logits_aligned = dlm_result.logits[..., :min_vocab]
-        ar_logits_aligned = ar_result.logits[..., :min_vocab]
+        min_vocab = min(dlm_logits_for_score.shape[-1], ar_logits_for_score.shape[-1])
+        dlm_logits_aligned = dlm_logits_for_score[..., :min_vocab]
+        ar_logits_aligned = ar_logits_for_score[..., :min_vocab]
         
         with state.instrumentor.trace_operation("consistency.score", {"run_id": run_id}):
             consistency_report = state.scorer.score(
                 dlm_logits=dlm_logits_aligned,
                 ar_logits=ar_logits_aligned,
-                dlm_tokens=dlm_result.token_ids,
-                ar_tokens=ar_result.token_ids,
+                dlm_tokens=dlm_tokens,
+                ar_tokens=ar_tokens,
             )
 
         state.store.record_consistency(
@@ -322,13 +337,15 @@ async def trigger_evaluation(
             windowed_scores=consistency_report.windowed_scores,
         )
 
-        # Drift detection.
+        # Drift detection (use length-aligned embeddings).
+        dlm_emb = dlm_result.embeddings[:min_len]
+        ar_emb = ar_result.embeddings[:min_len]
         with state.instrumentor.trace_operation("drift.detect", {"run_id": run_id}):
             drift_report = state.drift_detector.compare(
                 baseline_id="reference",
                 comparison_id=f"dlm-{run_id}",
-                baseline_embeddings=ar_result.embeddings,
-                comparison_embeddings=dlm_result.embeddings,
+                baseline_embeddings=ar_emb,
+                comparison_embeddings=dlm_emb,
             )
 
         state.store.record_drift(
